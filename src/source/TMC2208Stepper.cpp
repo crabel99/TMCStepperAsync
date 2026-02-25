@@ -184,7 +184,15 @@ void TMC2208Stepper::postReadCommunication() {
 	#endif
 }
 
-void TMC2208Stepper::write(uint8_t addr, uint32_t regVal) {
+void TMC2208Stepper::write(uint8_t addr, uint32_t regVal,
+                          void (*onComplete)(void* user, int status),
+                          void* user) {
+	#ifdef USE_ZERODMA
+	// Async path would go here
+	// TODO: Integrate with SERCOM UART async API
+	#endif
+	
+	// Synchronous blocking path (default & fallback)
 	uint8_t len = 7;
 	addr |= TMC_WRITE;
 	uint8_t datagram[] = {TMC2208_SYNC, slave_address, addr, (uint8_t)(regVal>>24), (uint8_t)(regVal>>16), (uint8_t)(regVal>>8), (uint8_t)(regVal>>0), 0x00};
@@ -199,6 +207,11 @@ void TMC2208Stepper::write(uint8_t addr, uint32_t regVal) {
 	postWriteCommunication();
 
 	delay(replyDelay);
+	
+	// If user provided a callback, invoke it after completion
+	if (onComplete) {
+		onComplete(user, 0);  // status=0 (success)
+	}
 }
 
 uint64_t TMC2208Stepper::_sendDatagram(uint8_t datagram[], const uint8_t len, uint16_t timeout) {
@@ -278,7 +291,16 @@ uint64_t TMC2208Stepper::_sendDatagram(uint8_t datagram[], const uint8_t len, ui
 	return out;
 }
 
-uint32_t TMC2208Stepper::read(uint8_t addr) {
+uint32_t TMC2208Stepper::read(uint8_t addr,
+                              void (*onComplete)(void* user, uint32_t value, int status),
+                              void* user) {
+
+	#ifdef USE_ZERODMA
+	// Async path would go here
+	// TODO: Integrate with SERCOM UART async API
+	#endif
+	
+	// Synchronous blocking path (default & fallback)
 	constexpr uint8_t len = 3;
 	addr |= TMC_READ;
 	uint8_t datagram[] = {TMC2208_SYNC, slave_address, addr, 0x00};
@@ -312,7 +334,14 @@ uint32_t TMC2208Stepper::read(uint8_t addr) {
 		}
 	}
 
-	return out>>8;
+	uint32_t result = out>>8;
+	
+	// If user provided a callback, invoke it with the result
+	if (onComplete) {
+		onComplete(user, result, CRCerror ? -1 : 0);  // status=-1 on CRC error, 0 on success
+	}
+	
+	return result;
 }
 
 uint8_t TMC2208Stepper::IFCNT() {

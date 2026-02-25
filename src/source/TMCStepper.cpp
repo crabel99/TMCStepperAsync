@@ -1,6 +1,52 @@
 #include "TMCStepper.h"
 #include "TMC_MACROS.h"
 
+#ifdef USE_ZERODMA
+// ============================================================================
+// Two-tier async queue management
+// ============================================================================
+// Design: Each driver instance has a local queue (RingBuffer) of 4 pending
+// operations, but only enqueues ONE operation to the SERCOM queue at a time.
+// This prevents SERCOM overflow when multiple driver instances operate
+// concurrently (8 drivers × 1 active = 8 SERCOM slots used).
+// ============================================================================
+
+TMCAsyncContext* TMCStepper::allocateContext() {
+  uint32_t startTime = millis();
+  while (!_asyncCtxFree && (millis() - startTime) < ASYNC_TIMEOUT_MS)
+    yield();
+
+  if (!_asyncCtxFree) return nullptr;
+
+  uint8_t i = __builtin_ctz(_asyncCtxFree);
+  _asyncCtxFree &= ~(1 << i);
+  _asyncCtxPool[i] = {};
+  return &_asyncCtxPool[i];
+}
+
+void TMCStepper::freeContext(TMCAsyncContext* ctx) {
+  uint8_t i = static_cast<uint8_t>(ctx - _asyncCtxPool);
+  _asyncCtxFree |= (1 << i);
+  if (_activeCtx == ctx) _activeCtx = nullptr;
+}
+
+void TMCStepper::enqueueNextPending() {
+	// Base implementation: just checks and prepares
+	// Derived classes (TMC2130/TMC2208) override this to actually start SERCOM transactions
+	if (_asyncQueue.available() == 0) {
+		_sercomEnqueued = false;
+		return;
+	}
+	_sercomEnqueued = true;  // Will be set by derived class when actually enqueued
+}
+
+void TMCStepper::asyncWait() {
+	uint32_t startTime = millis();
+  while (_asyncQueue.available() && (millis() - startTime) < ASYNC_TIMEOUT_MS)
+		yield();
+}
+#endif // USE_ZERODMA
+
 /*
   Requested current = mA = I_rms/1000
   Equation for current:

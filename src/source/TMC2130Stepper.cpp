@@ -1,5 +1,27 @@
 #include "TMCStepper.h"
 #include "TMC_MACROS.h"
+#include <cstring>
+
+#ifdef USE_ZERODMA
+namespace {
+enum AsyncPhase : uint8_t {
+  PHASE_READ_CMD = 0,
+  PHASE_SHIFT_PRE = 1,
+  PHASE_SHIFT_POST = 2,
+  PHASE_READ_DATA = 3,
+  PHASE_WRITE_CMD = 4,
+  PHASE_WRITE_SHIFT = 5
+};
+
+inline void fillZeroFrame(uint8_t* buf) {
+  buf[0] = 0x00;
+  buf[1] = 0x00;
+  buf[2] = 0x00;
+  buf[3] = 0x00;
+  buf[4] = 0x00;
+}
+}
+#endif // USE_ZERODMA
 
 int8_t TMC2130Stepper::chain_length = 0;
 uint32_t TMC2130Stepper::spi_speed = 16000000/8;
@@ -95,8 +117,275 @@ void TMC2130Stepper::transferEmptyBytes(const uint8_t n) {
   }
 }
 
+#ifdef USE_ZERODMA
+// Helper: Start SERCOM transaction for a queued context
+// Called both initially from read()/write() and from enqueueNextPending()
+bool TMC2130Stepper::startSercomTransaction(TMCAsyncContext* ctx) {
+  SERCOM* sercom = SPI.getSercom();
+  if (!sercom || !ctx)
+    return false;
+
+  // Transaction already setup in context, just enqueue it
+  beginTransaction();
+  switchCSpin(LOW);
+  ctx->csActive = true;
+
+  // Set flag and active context before enqueueSPI to prevent race:
+  // ISR may fire during or immediately after enqueueSPI returns.
+  _sercomEnqueued = true;
+  _activeCtx = ctx;
+  if (!sercom->enqueueSPI(&ctx->txn)) {
+    _sercomEnqueued = false;
+    switchCSpin(HIGH);
+    endTransaction();
+    return false;
+  }
+
+  return true;
+}
+
+// Override to actually start the next queued SPI transaction
+void TMC2130Stepper::enqueueNextPending() {
+  uint8_t ctxIdx;
+  while (_asyncQueue.peek(ctxIdx)) {
+
+    TMCAsyncContext* ctx = &_asyncCtxPool[ctxIdx];
+    if (startSercomTransaction(ctx)) {
+      return;
+    }
+
+    // Failed to start - remove from queue and continue draining.
+    _asyncQueue.read(ctxIdx);
+    freeContext(ctx);
+  }
+
+  _sercomEnqueued = false;
+}
+
+void TMC2130Stepper::onAsyncTxnComplete(void* user, int status) {
+  if (!user) {
+    return;
+  }
+
+  TMCAsyncContext* ctx = static_cast<TMCAsyncContext*>(user);
+  TMC2130Stepper* self = static_cast<TMC2130Stepper*>(ctx->owner);
+  if (!self) {
+    return;
+  }
+
+  ctx->completionStatus = status;
+
+  if (status != static_cast<int>(SercomSpiError::SUCCESS)) {
+    self->switchCSpin(HIGH);
+    self->endTransaction();
+    uint8_t dummyIdx;
+    self->_asyncQueue.read(dummyIdx);
+    ctx->isDone = true;                // Unblock any asyncWait caller
+    self->freeContext(ctx);
+    self->enqueueNextPending();
+    if (ctx->operation == TMCAsyncContext::READ && ctx->readCb)
+      ctx->readCb(ctx->userCtx, 0, status);
+    if (ctx->operation == TMCAsyncContext::WRITE && ctx->writeCb)
+      ctx->writeCb(ctx->userCtx, status);
+    return;
+  }
+
+  // default context configuration for both read and write
+  fillZeroFrame(ctx->tx_buf);
+  ctx->txn.txPtr = ctx->tx_buf;
+  ctx->txn.rxPtr = ctx->rx_buf;
+  ctx->txn.length = 5;
+  ctx->txn.chainNext = true;
+
+  if (ctx->operation == TMCAsyncContext::READ) {
+    switch (ctx->phase) {
+      case PHASE_READ_CMD:
+        if (ctx->preShiftRemaining > 0) {
+          ctx->phase = PHASE_SHIFT_PRE;
+          ctx->preShiftRemaining--;
+          return;
+        }
+        self->switchCSpin(HIGH);
+        self->switchCSpin(LOW);
+        if (ctx->postShiftRemaining > 0) {
+          ctx->phase = PHASE_SHIFT_POST;
+          ctx->postShiftRemaining--;
+          return;
+        }
+        ctx->phase = PHASE_READ_DATA;
+        ctx->tx_buf[0] = ctx->addressByte;
+        return;
+
+      case PHASE_SHIFT_PRE:
+        if (ctx->preShiftRemaining > 0) {
+          ctx->preShiftRemaining--;
+          return;
+        }
+        self->switchCSpin(HIGH);
+        self->switchCSpin(LOW);
+        if (ctx->postShiftRemaining > 0) {
+          ctx->phase = PHASE_SHIFT_POST;
+          ctx->postShiftRemaining--;
+          return;
+        }
+        ctx->phase = PHASE_READ_DATA;
+        ctx->tx_buf[0] = ctx->addressByte;
+        return;
+
+      case PHASE_SHIFT_POST:
+        if (ctx->postShiftRemaining > 0) {
+          ctx->postShiftRemaining--;
+          return;
+        }
+        ctx->phase = PHASE_READ_DATA;
+        ctx->tx_buf[0] = ctx->addressByte;
+        return;
+
+      case PHASE_READ_DATA:
+        ctx->txn.chainNext = false;
+        ctx->status_response = ctx->rx_buf[0];
+        self->status_response = ctx->status_response;
+        ctx->readResult = (static_cast<uint32_t>(ctx->rx_buf[1]) << 24) |
+                          (static_cast<uint32_t>(ctx->rx_buf[2]) << 16) |
+                          (static_cast<uint32_t>(ctx->rx_buf[3]) << 8) |
+                          (static_cast<uint32_t>(ctx->rx_buf[4]));
+        self->switchCSpin(HIGH);
+        self->endTransaction();
+        // Copy full 5-byte frame to class-level buffer before freeing context.
+        // Sync reads consume _lastRxBuf after drain-wait; async callbacks get value directly.
+        memcpy(self->_lastRxBuf, ctx->rx_buf, 5);
+        uint8_t dummyIdx;
+        self->_asyncQueue.read(dummyIdx);  // Remove from queue
+        ctx->isDone = true;                // Signal asyncWait before freeing
+        self->freeContext(ctx);            // Free context slot
+        self->enqueueNextPending();        // Start next queued operation
+        if (ctx->readCb)
+          ctx->readCb(ctx->userCtx, ctx->readResult, status);
+        return;
+
+      default:
+        ctx->txn.chainNext = false;
+        return;
+    }
+  }
+
+  if (ctx->operation == TMCAsyncContext::WRITE) {
+    switch (ctx->phase) {
+      case PHASE_WRITE_CMD:
+        if (ctx->preShiftRemaining > 0) {
+          ctx->phase = PHASE_WRITE_SHIFT;
+          ctx->preShiftRemaining--;
+          return;
+        }
+        ctx->txn.chainNext = false;
+        self->switchCSpin(HIGH);
+        self->endTransaction();
+        uint8_t dummyIdx1;
+        self->_asyncQueue.read(dummyIdx1);  // Remove from queue
+        ctx->isDone = true;                 // Signal asyncWait before freeing
+        self->freeContext(ctx);             // Free context slot
+        self->enqueueNextPending();         // Start next queued operation
+        if (ctx->writeCb)
+          ctx->writeCb(ctx->userCtx, status);
+        return;
+
+      case PHASE_WRITE_SHIFT:
+        if (ctx->preShiftRemaining > 0) {
+          ctx->preShiftRemaining--;
+          return;
+        }
+        ctx->txn.chainNext = false;
+        self->switchCSpin(HIGH);
+        self->endTransaction();
+        uint8_t dummyIdx2;
+        self->_asyncQueue.read(dummyIdx2);  // Remove from queue
+        ctx->isDone = true;                 // Signal asyncWait before freeing
+        self->freeContext(ctx);             // Free context slot
+        self->enqueueNextPending();         // Start next queued operation
+        if (ctx->writeCb)
+          ctx->writeCb(ctx->userCtx, status);
+        return;
+
+      default:
+        ctx->txn.chainNext = false;
+        return;
+    }
+  }
+}
+#endif
+
 __attribute__((weak))
-uint32_t TMC2130Stepper::read(uint8_t addressByte) {
+uint32_t TMC2130Stepper::read(uint8_t addressByte,
+                               void (*onComplete)(void* user, uint32_t value, int status),
+                               void* user) {
+#ifdef USE_ZERODMA
+  SERCOM* sercom = SPI.getSercom();
+  if (sercom == nullptr || TMC_SW_SPI != nullptr) {
+    if (onComplete)
+      onComplete(user, 0, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
+    return 0;
+  }
+
+  TMCAsyncContext* ctx = allocateContext();
+  if (!ctx) {
+    if (onComplete)
+      onComplete(user, 0, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
+    return 0;
+  }
+
+  // Setup async context
+  ctx->operation = TMCAsyncContext::READ;
+  ctx->phase = PHASE_READ_CMD;
+  ctx->addressByte = addressByte;
+  ctx->link_index = link_index;
+  ctx->chain_length = chain_length;
+  ctx->preShiftRemaining = (link_index > 1) ? (link_index - 1) : 0;
+  int8_t iAfterPreShift = (link_index > 1) ? link_index : 1;
+  ctx->postShiftRemaining = (chain_length > iAfterPreShift) ? (chain_length - iAfterPreShift) : 0;
+  ctx->readCb = onComplete;
+  ctx->writeCb = nullptr;
+  ctx->userCtx = user;
+  ctx->owner = this;
+  ctx->readResult = 0;
+  ctx->status_response = 0;
+
+  fillZeroFrame(ctx->tx_buf);
+  ctx->tx_buf[0] = addressByte;
+
+  ctx->txn.txPtr = ctx->tx_buf;
+  ctx->txn.rxPtr = ctx->rx_buf;
+  ctx->txn.length = 5;
+  ctx->txn.onComplete = &TMC2130Stepper::onAsyncTxnComplete;
+  ctx->txn.user = ctx;
+  ctx->txn.chainNext = false;
+
+  uint8_t ctxIdx = static_cast<uint8_t>(ctx - _asyncCtxPool);
+
+  if (!_asyncQueue.store(ctxIdx)) {
+    freeContext(ctx);
+    return 0;
+  }
+
+  // If no operation currently active, start this one immediately
+  if (!_sercomEnqueued) {
+    if (!startSercomTransaction(ctx)) {
+      uint8_t dummyIdx;
+      _asyncQueue.read(dummyIdx);
+      freeContext(ctx);
+      return 0;
+    }
+  }
+
+  if (!onComplete) {
+    asyncWait();
+    return (static_cast<uint32_t>(_lastRxBuf[1]) << 24) |
+           (static_cast<uint32_t>(_lastRxBuf[2]) << 16) |
+           (static_cast<uint32_t>(_lastRxBuf[3]) << 8) |
+           (static_cast<uint32_t>(_lastRxBuf[4]));
+  }
+
+  return 0;
+#else
   uint32_t out = 0UL;
   int8_t i = 1;
 
@@ -134,11 +423,85 @@ uint32_t TMC2130Stepper::read(uint8_t addressByte) {
 
   endTransaction();
   switchCSpin(HIGH);
+
   return out;
+#endif
 }
 
 __attribute__((weak))
-void TMC2130Stepper::write(uint8_t addressByte, uint32_t config) {
+void TMC2130Stepper::write(uint8_t addressByte, uint32_t config,
+                            void (*onComplete)(void* user, int status),
+                            void* user) {
+#ifdef USE_ZERODMA
+  // ========================================
+  // SERCOM DMA Path (USE_ZERODMA defined)
+  // Writes are always fire-and-forget (async).
+  // Back-pressure: if pool or queue is full, spin-wait for a slot.
+  // ========================================
+  SERCOM* sercom = SPI.getSercom();
+  if (sercom == nullptr || TMC_SW_SPI != nullptr) {
+    if (onComplete)
+      onComplete(user, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
+    return;
+  }
+
+  TMCAsyncContext* ctx = allocateContext();
+  if (!ctx) {
+    if (onComplete)
+      onComplete(user, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
+    return;
+  }
+
+  // Setup async context
+  ctx->operation = TMCAsyncContext::WRITE;
+  ctx->phase = PHASE_WRITE_CMD;
+  ctx->addressByte = addressByte | TMC_WRITE;
+  ctx->configValue = config;
+  ctx->link_index = link_index;
+  ctx->chain_length = chain_length;
+  ctx->preShiftRemaining = (link_index > 1) ? (link_index - 1) : 0;
+  ctx->postShiftRemaining = 0;
+  ctx->readCb = nullptr;
+  ctx->writeCb = onComplete;
+  ctx->userCtx = user;
+  ctx->owner = this;
+
+  ctx->tx_buf[0] = ctx->addressByte;
+  ctx->tx_buf[1] = (config >> 24) & 0xFF;
+  ctx->tx_buf[2] = (config >> 16) & 0xFF;
+  ctx->tx_buf[3] = (config >> 8) & 0xFF;
+  ctx->tx_buf[4] = (config >> 0) & 0xFF;
+
+  ctx->txn.txPtr = ctx->tx_buf;
+  ctx->txn.rxPtr = ctx->rx_buf;
+  ctx->txn.length = 5;
+  ctx->txn.onComplete = &TMC2130Stepper::onAsyncTxnComplete;
+  ctx->txn.user = ctx;
+  ctx->txn.chainNext = false;
+
+  uint8_t ctxIdx = static_cast<uint8_t>(ctx - _asyncCtxPool);
+
+  if (!_asyncQueue.store(ctxIdx)) {
+    freeContext(ctx);
+    return;
+  }
+
+  // If no operation currently active, start this one immediately
+  if (!_sercomEnqueued) {
+    if (!startSercomTransaction(ctx)) {
+      uint8_t dummyIdx;
+      _asyncQueue.read(dummyIdx);
+      freeContext(ctx);
+      return;
+    }
+  }
+
+  return;
+
+#else
+  // ========================================
+  // Synchronous Blocking Path (default if USE_ZERODMA not defined)
+  // ========================================
   addressByte |= TMC_WRITE;
   int8_t i = 1;
 
@@ -159,6 +522,12 @@ void TMC2130Stepper::write(uint8_t addressByte, uint32_t config) {
 
   endTransaction();
   switchCSpin(HIGH);
+  
+  // If user provided a callback, invoke it after completion
+  if (onComplete) {
+    onComplete(user, 0);  // status=0 (success)
+  }
+#endif
 }
 
 void TMC2130Stepper::begin() {

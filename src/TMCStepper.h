@@ -26,6 +26,15 @@
 	#endif
 #endif
 
+#if defined(USE_ZERODMA) && defined(ARDUINO) && defined(__has_include)
+  #if __has_include("SERCOM_Txn.h")
+    #include "SERCOM_Txn.h"
+  #endif
+  #if __has_include("RingBuffer.h")
+    #include "RingBuffer.h"
+  #endif
+#endif
+
 #if (__cplusplus == 201703L) && defined(__has_include)
 	#define SW_CAPABLE_PLATFORM __has_include(<SoftwareSerial.h>)
 #elif defined(__AVR__) || defined(TARGET_LPC1768) || defined(ARDUINO_ARCH_STM32)
@@ -63,6 +72,50 @@
 
 #define TMCSTEPPER_VERSION 0x000703 // v0.7.3
 
+#ifdef USE_ZERODMA
+// Forward declaration
+class TMCStepper;
+
+// Generic async context structure for TMC register operations
+// Used by both SPI-based (TMC2130/2160/5130/5160) and UART-based (TMC2208/2209/2224) drivers
+struct TMCAsyncContext {
+	// Operation type
+	enum OpType : uint8_t { NONE = 0, READ = 1, WRITE = 2 };
+	
+	// Context tracking
+	OpType operation;                    ///< Type of operation in progress
+	uint8_t phase;                       ///< Current phase of multi-phase operation
+	
+	// Register and configuration
+	uint8_t addressByte;                 ///< Address byte (RW bit handled by caller)
+	uint32_t configValue;                ///< Value for write operations or result for reads
+	uint32_t readResult;                 ///< Final read result after all phases complete
+	
+	// Daisy-chain and protocol parameters (SPI-specific, unused by UART)
+	int8_t link_index;                   ///< Target device index in daisy chain (TMC2130-style)
+	int8_t chain_length;                 ///< Total chain length (for shift-through calculations)
+	uint8_t status_response;             ///< Status byte captured during transaction
+	uint8_t preShiftRemaining;           ///< Remaining 5-byte shifts before target (read/write)
+	uint8_t postShiftRemaining;          ///< Remaining 5-byte shifts after target (read)
+	
+	// DMA/Transaction buffers (sized for both SPI and UART)
+	uint8_t tx_buf[12];                  ///< Transmit buffer (SPI=5, UART=8)
+	uint8_t rx_buf[12];                  ///< Receive buffer (SPI=5, UART=12)
+	
+	// Completion tracking
+	void (*readCb)(void* user, uint32_t value, int status); ///< Read completion callback
+	void (*writeCb)(void* user, int status);               ///< Write completion callback
+	void* userCtx;                       ///< User context passed to callback
+	void* owner;                         ///< Owning driver instance
+	volatile bool isDone;                ///< Flag indicating completion
+	int completionStatus;                ///< Status code passed to callback (0=success, <0=error)
+	
+	// Protocol-specific state
+	bool csActive;                       ///< Whether CS is currently LOW (active) - SPI only
+	SercomTxn txn;                       ///< SERCOM transaction for async SPI/UART
+};
+#endif // USE_ZERODMA
+
 class TMCStepper {
 	public:
 		uint16_t cs2rms(uint8_t CS);
@@ -72,6 +125,27 @@ class TMCStepper {
 		void hold_multiplier(float val) { holdMultiplier = val; }
 		float hold_multiplier() { return holdMultiplier; }
 		uint8_t test_connection();
+
+#ifdef USE_ZERODMA
+		// Async context pool management (two-tier queue system)
+		static constexpr uint8_t ASYNC_CTX_POOL_SIZE = 4;      ///< Local queue depth per driver instance
+		static constexpr uint32_t ASYNC_TIMEOUT_MS = 100;      ///< Timeout for async wait operations
+		TMCAsyncContext _asyncCtxPool[ASYNC_CTX_POOL_SIZE]{};  ///< Pool of contexts for queued operations
+		uint8_t _asyncCtxFree = 0x0F;                          ///< Bitmap: 1=free (4 bits for 4 slots)
+		RingBufferN<ASYNC_CTX_POOL_SIZE, uint8_t> _asyncQueue; ///< Queue of pending context indices
+		volatile bool _sercomEnqueued = false;                 ///< True if operation active in SERCOM queue
+		TMCAsyncContext* _activeCtx = nullptr;                 ///< Context currently executing in SERCOM
+		uint8_t _lastRxBuf[5] = {};                            ///< Last completed read result: [0]=status, [1-4]=data bytes
+
+		// Context pool operations
+		TMCAsyncContext* allocateContext();     ///< Allocate a context from the pool
+		void freeContext(TMCAsyncContext* ctx); ///< Return a context to the pool
+		void asyncWait();                       ///< Wait for local queue to drain (sync read completion)
+		
+	protected:
+		virtual void enqueueNextPending(); ///< Dequeue and start next pending operation (override in derived class)
+	public:
+#endif
 
 		// Helper functions
 		void microsteps(uint16_t ms);
@@ -131,8 +205,12 @@ class TMCStepper {
 		struct TSTEP_t { constexpr static uint8_t address = 0x12; };
 		struct MSCNT_t { constexpr static uint8_t address = 0x6A; };
 
-		virtual void write(uint8_t, uint32_t) = 0;
-		virtual uint32_t read(uint8_t) = 0;
+		virtual void write(uint8_t addr, uint32_t value,
+		                   void (*onComplete)(void* user, int status) = nullptr,
+		                   void* user = nullptr) = 0;
+		virtual uint32_t read(uint8_t addr,
+		                       void (*onComplete)(void* user, uint32_t value, int status) = nullptr,
+		                       void* user = nullptr) = 0;
 		virtual void vsense(bool) = 0;
 		virtual bool vsense(void) = 0;
 		virtual uint32_t DRV_STATUS() = 0;
@@ -149,8 +227,17 @@ class TMCStepper {
 		float holdMultiplier = 0.5;
 };
 
+// ============================================================================
+// ============================================================================
+// Async Context Structures - Support for DMA-driven multi-phase I/O
+// Context structure and pool management now in TMCStepper base class
+// Used by both SPI (TMC2130/2160/5130/5160/2660) and UART (TMC2208/2209) variants
+// ============================================================================
+
 class TMC2130Stepper : public TMCStepper {
 	public:
+		static constexpr float default_RS = 0.11;
+		
 		TMC2130Stepper(uint16_t pinCS, float RS = default_RS, int8_t link_index = -1);
 		TMC2130Stepper(uint16_t pinCS, uint16_t pinMOSI, uint16_t pinMISO, uint16_t pinSCK, int8_t link_index = -1);
 		TMC2130Stepper(uint16_t pinCS, float RS, uint16_t pinMOSI, uint16_t pinMISO, uint16_t pinSCK, int8_t link_index = -1);
@@ -237,34 +324,34 @@ class TMC2130Stepper : public TMCStepper {
 		uint32_t CHOPCONF();
 		void CHOPCONF(						uint32_t value);
 		void toff(								uint8_t B);
-		void hstrt(								uint8_t B);
-		void hend(								uint8_t B);
+		void hstrt(								uint8_t B) override;
+		void hend(								uint8_t B) override;
 		//void fd(									uint8_t B);
 		void disfdcc(							bool 		B);
 		void rndtf(								bool 		B);
 		void chm(									bool 		B);
-		void tbl(									uint8_t B);
-		void vsense(							bool 		B);
+		void tbl(									uint8_t B) override;
+		void vsense(							bool 		B) override;
 		void vhighfs(							bool 		B);
 		void vhighchm(						bool 		B);
 		void sync(								uint8_t B);
-		void mres(								uint8_t B);
+		void mres(								uint8_t B) override;
 		void intpol(							bool 		B);
 		void dedge(								bool 		B);
 		void diss2g(							bool 		B);
 		uint8_t toff();
-		uint8_t hstrt();
-		uint8_t hend();
+		uint8_t hstrt() override;
+		uint8_t hend() override;
 		//uint8_t fd();
 		bool 	disfdcc();
 		bool 	rndtf();
 		bool 	chm();
-		uint8_t tbl();
-		bool 	vsense();
+		uint8_t tbl() override;
+		bool 	vsense() override;
 		bool 	vhighfs();
 		bool 	vhighchm();
 		uint8_t sync();
-		uint8_t mres();
+		uint8_t mres() override;
 		bool 	intpol();
 		bool 	dedge();
 		bool 	diss2g();
@@ -296,7 +383,7 @@ class TMC2130Stepper : public TMCStepper {
 		uint8_t dc_sg();
 
 		// R: DRV_STATUS
-		uint32_t DRV_STATUS();
+		uint32_t DRV_STATUS() override;
 		uint16_t sg_result();
 		bool fsactive();
 		uint8_t cs_actual();
@@ -348,8 +435,16 @@ class TMC2130Stepper : public TMCStepper {
 		void endTransaction();
 		uint8_t transfer(const uint8_t data);
 		void transferEmptyBytes(const uint8_t n);
-		void write(uint8_t addressByte, uint32_t config);
-		uint32_t read(uint8_t addressByte);
+		void write(uint8_t addressByte, uint32_t config,
+		           void (*onComplete)(void* user, int status) = nullptr,
+		           void* user = nullptr) override;
+		uint32_t read(uint8_t addressByte,
+		              void (*onComplete)(void* user, uint32_t value, int status) = nullptr,
+		              void* user = nullptr) override;
+		
+		#ifdef USE_ZERODMA
+		static void onAsyncTxnComplete(void* user, int status);
+		#endif
 
 		INIT_REGISTER(GCONF){{.sr=0}};		// 32b
 		INIT_REGISTER(TCOOLTHRS){.sr=0};	// 32b
@@ -367,11 +462,19 @@ class TMC2130Stepper : public TMCStepper {
 		struct LOST_STEPS_t { constexpr static uint8_t address = 0x73; };
 		struct DRV_STATUS_t { constexpr static uint8_t address = 0X6F; };
 
+#ifdef USE_ZERODMA
+	protected:
+		// Two-tier queue helpers (override from base class)
+		virtual void enqueueNextPending() override;
+		bool startSercomTransaction(TMCAsyncContext* ctx);
+#endif
+
+	protected:
 		static uint32_t spi_speed; // Default 2MHz
 		const uint16_t _pinCS;
 		SW_SPIClass * TMC_SW_SPI = nullptr;
-		static constexpr float default_RS = 0.11;
-
+		
+	private:
 		int8_t link_index;
 		static int8_t chain_length;
 };
@@ -914,29 +1017,29 @@ class TMC2208Stepper : public TMCStepper {
 		// RW: CHOPCONF
 		void CHOPCONF(uint32_t input);
 		void toff(uint8_t B);
-		void hstrt(uint8_t B);
-		void hend(uint8_t B);
-		void tbl(uint8_t B);
-		void vsense(bool B);
-		void mres(uint8_t B);
+		void hstrt(uint8_t B) override;
+		void hend(uint8_t B) override;
+		void tbl(uint8_t B) override;
+		void vsense(bool B) override;
+		void mres(uint8_t B) override;
 		void intpol(bool B);
 		void dedge(bool B);
 		void diss2g(bool B);
 		void diss2vs(bool B);
 		uint32_t CHOPCONF();
 		uint8_t toff();
-		uint8_t hstrt();
-		uint8_t hend();
-		uint8_t tbl();
-		bool vsense();
-		uint8_t mres();
+		uint8_t hstrt() override;
+		uint8_t hend() override;
+		uint8_t tbl() override;
+		bool vsense() override;
+		uint8_t mres() override;
 		bool intpol();
 		bool dedge();
 		bool diss2g();
 		bool diss2vs();
 
 		// R: DRV_STATUS
-		uint32_t DRV_STATUS();
+		uint32_t DRV_STATUS() override;
 		bool otpw();
 		bool ot();
 		bool s2ga();
@@ -1018,8 +1121,12 @@ class TMC2208Stepper : public TMCStepper {
 		uint8_t serial_write(const uint8_t data);
 		void postWriteCommunication();
 		void postReadCommunication();
-		void write(uint8_t, uint32_t);
-		uint32_t read(uint8_t);
+		void write(uint8_t addr, uint32_t value,
+		           void (*onComplete)(void* user, int status) = nullptr,
+		           void* user = nullptr) override;
+		uint32_t read(uint8_t addr,
+		              void (*onComplete)(void* user, uint32_t value, int status) = nullptr,
+		              void* user = nullptr) override;
 		const uint8_t slave_address;
 		uint8_t calcCRC(uint8_t datagram[], uint8_t len);
 		static constexpr uint8_t  TMC2208_SYNC = 0x05,
