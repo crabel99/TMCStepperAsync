@@ -734,6 +734,8 @@ class TMC5130Stepper : public TMC2160Stepper {
 		// RW: X_ENC
 		int32_t X_ENC();
 		void X_ENC(int32_t input);
+		void X_ENC_async(void (*onComplete)(void* user, uint32_t value, int status),
+		                 void* user = nullptr);
 		// W: ENC_CONST
 		uint32_t ENC_CONST();
 		void ENC_CONST(uint32_t input);

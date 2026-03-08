@@ -208,6 +208,17 @@ int32_t TMC5130Stepper::X_ENC() { return read(X_ENC_t::address); }
 void TMC5130Stepper::X_ENC(int32_t input) {
   write(X_ENC_t::address, input);
 }
+void TMC5130Stepper::X_ENC_async(void (*onComplete)(void *user, uint32_t value,
+                                                    int status),
+                                 void *user) {
+#ifdef USE_ZERODMA
+  read(X_ENC_t::address, onComplete, user);
+#else
+  const uint32_t value = read(X_ENC_t::address);
+  if (onComplete)
+    onComplete(user, value, 0);
+#endif
+}
 ///////////////////////////////////////////////////////////////////////////////////////
 // W: ENC_CONST
 uint32_t TMC5130Stepper::ENC_CONST() { return ENC_CONST_register.sr; }

@@ -363,6 +363,8 @@ uint32_t TMC2130Stepper::read(uint8_t addressByte,
 
   if (!_asyncQueue.store(ctxIdx)) {
     freeContext(ctx);
+    if (onComplete)
+      onComplete(user, 0, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
     return 0;
   }
 
@@ -372,6 +374,8 @@ uint32_t TMC2130Stepper::read(uint8_t addressByte,
       uint8_t dummyIdx;
       _asyncQueue.read(dummyIdx);
       freeContext(ctx);
+      if (onComplete)
+        onComplete(user, 0, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
       return 0;
     }
   }
@@ -483,6 +487,8 @@ void TMC2130Stepper::write(uint8_t addressByte, uint32_t config,
 
   if (!_asyncQueue.store(ctxIdx)) {
     freeContext(ctx);
+    if (onComplete)
+      onComplete(user, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
     return;
   }
 
@@ -492,6 +498,8 @@ void TMC2130Stepper::write(uint8_t addressByte, uint32_t config,
       uint8_t dummyIdx;
       _asyncQueue.read(dummyIdx);
       freeContext(ctx);
+      if (onComplete)
+        onComplete(user, static_cast<int>(SercomSpiError::UNKNOWN_ERROR));
       return;
     }
   }
