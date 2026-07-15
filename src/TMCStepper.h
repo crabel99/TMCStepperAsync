@@ -128,10 +128,10 @@ class TMCStepper {
 
 #ifdef USE_ZERODMA
 		// Async context pool management (two-tier queue system)
-		static constexpr uint8_t ASYNC_CTX_POOL_SIZE = 4;      ///< Local queue depth per driver instance
+		static constexpr uint8_t ASYNC_CTX_POOL_SIZE = 7;      ///< Local queue depth per driver instance (RingBufferN<7> → capacity 6)
 		static constexpr uint32_t ASYNC_TIMEOUT_MS = 100;      ///< Timeout for async wait operations
 		TMCAsyncContext _asyncCtxPool[ASYNC_CTX_POOL_SIZE]{};  ///< Pool of contexts for queued operations
-		uint8_t _asyncCtxFree = 0x0F;                          ///< Bitmap: 1=free (4 bits for 4 slots)
+		uint8_t _asyncCtxFree = 0x7F;                          ///< Bitmap: 1=free (7 bits for 7 slots)
 		RingBufferN<ASYNC_CTX_POOL_SIZE, uint8_t> _asyncQueue; ///< Queue of pending context indices
 		volatile bool _sercomEnqueued = false;                 ///< True if operation active in SERCOM queue
 		TMCAsyncContext* _activeCtx = nullptr;                 ///< Context currently executing in SERCOM
@@ -180,6 +180,8 @@ class TMCStepper {
 
 		// R: TSTEP
 		uint32_t TSTEP();
+		void TSTEP_async(void (*onComplete)(void *user, uint32_t value, int status),
+		                 void *user = nullptr);
 
 		// W: TPWMTHRS
 		uint32_t TPWMTHRS();
@@ -644,7 +646,11 @@ class TMC5130Stepper : public TMC2160Stepper {
 
 		// R+C: RAMP_STAT
 		uint32_t RAMP_STAT();
-		bool status_stop_l();
+                void RAMP_STAT_async(void (*onComplete)(void *user,
+                                                        uint32_t value,
+                                                        int status),
+                                     void *user = nullptr);
+                bool status_stop_l();
 		bool status_stop_r();
 		bool status_latch_l();
 		bool status_latch_r();
@@ -697,9 +703,18 @@ class TMC5130Stepper : public TMC2160Stepper {
 		// RW: XACTUAL
 		int32_t XACTUAL();
 		void XACTUAL(int32_t input);
+		void XACTUAL_async(void (*onComplete)(void *user, uint32_t value, int status),
+		                  void *user = nullptr);
 		// R: VACTUAL
 		int32_t VACTUAL();
-		// W: VSTART
+                void DRV_STATUS_async(void (*onComplete)(void *user,
+                                                         uint32_t value,
+                                                         int status),
+                                      void *user = nullptr);
+                void GSTAT_async(void (*onComplete)(void *user, uint32_t value,
+                                                    int status),
+                                 void *user = nullptr);
+                // W: VSTART
 		uint32_t VSTART();
 		void VSTART(uint32_t input);
 		// W: A1

@@ -120,6 +120,16 @@ int32_t TMC5130Stepper::XACTUAL() { return read(XACTUAL_register.address); }
 void TMC5130Stepper::XACTUAL(int32_t input) {
   write(XACTUAL_register.address, input);
 }
+void TMC5130Stepper::XACTUAL_async(
+    void (*onComplete)(void *user, uint32_t value, int status), void *user) {
+#ifdef USE_ZERODMA
+  read(XACTUAL_register.address, onComplete, user);
+#else
+  const uint32_t value = read(XACTUAL_register.address);
+  if (onComplete)
+    onComplete(user, value, 0);
+#endif
+}
 ///////////////////////////////////////////////////////////////////////////////////////
 // R: VACTUAL
 int32_t TMC5130Stepper::VACTUAL() {
@@ -128,6 +138,40 @@ int32_t TMC5130Stepper::VACTUAL() {
     int24 |= 0xFF000000;
   }
   return int24;
+}
+
+void TMC5130Stepper::DRV_STATUS_async(
+    void (*onComplete)(void *user, uint32_t value, int status), void *user) {
+#ifdef USE_ZERODMA
+  read(DRV_STATUS_t::address, onComplete, user);
+#else
+  const uint32_t value = read(DRV_STATUS_t::address);
+  if (onComplete)
+    onComplete(user, value, 0);
+#endif
+}
+
+void TMC5130Stepper::RAMP_STAT_async(
+    void (*onComplete)(void *user, uint32_t value, int status), void *user) {
+#ifdef USE_ZERODMA
+  read(RAMP_STAT_t::address, onComplete, user);
+#else
+  const uint32_t value = read(RAMP_STAT_t::address);
+  if (onComplete)
+    onComplete(user, value, 0);
+#endif
+}
+
+void TMC5130Stepper::GSTAT_async(void (*onComplete)(void *user, uint32_t value,
+                                                    int status),
+                                 void *user) {
+#ifdef USE_ZERODMA
+  read(GSTAT_t::address, onComplete, user);
+#else
+  const uint32_t value = read(GSTAT_t::address);
+  if (onComplete)
+    onComplete(user, value, 0);
+#endif
 }
 ///////////////////////////////////////////////////////////////////////////////////////
 // W: VSTART

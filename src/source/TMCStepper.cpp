@@ -2,6 +2,18 @@
 #include "TMC_MACROS.h"
 
 #ifdef USE_ZERODMA
+namespace {
+
+inline bool inExceptionContext() {
+#if defined(SCB_ICSR_VECTACTIVE_Msk)
+  return (SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) != 0;
+#else
+  return false;
+#endif
+}
+
+} // namespace
+
 // ============================================================================
 // Two-tier async queue management
 // ============================================================================
@@ -12,6 +24,11 @@
 // ============================================================================
 
 TMCAsyncContext* TMCStepper::allocateContext() {
+  // Never spin/yield from exception context (ISR/PendSV). If the pool is full,
+  // fail fast so callbacks can unwind and free existing contexts.
+  if (!_asyncCtxFree && inExceptionContext())
+    return nullptr;
+
   uint32_t startTime = millis();
   while (!_asyncCtxFree && (millis() - startTime) < ASYNC_TIMEOUT_MS)
     yield();
@@ -174,6 +191,10 @@ void TMCStepper::TPOWERDOWN(uint8_t input) {
 ///////////////////////////////////////////////////////////////////////////////////////
 // R: TSTEP
 uint32_t TMCStepper::TSTEP() { return read(TSTEP_t::address); }
+void TMCStepper::TSTEP_async(void (*onComplete)(void *user, uint32_t value, int status),
+                             void *user) {
+  read(TSTEP_t::address, onComplete, user);
+}
 ///////////////////////////////////////////////////////////////////////////////////////
 // W: TPWMTHRS
 uint32_t TMCStepper::TPWMTHRS() { return TPWMTHRS_register.sr; }
